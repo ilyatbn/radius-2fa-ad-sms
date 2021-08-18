@@ -1,158 +1,212 @@
-// requirements
-var radius = require('radius')
-var dgram = require("dgram")
-var request = require('request')
-var activedirectory = require('activedirectory')
+//Imports
+var radius = require('radius');
+var dgram = require("dgram");
+var request = require('request');
+var activeDirectory = require('activeDirectory');
+var smtpClient = require('mail');
+var randomize = require('randomatic');
+var express = require('express');
+var PouchDB = require('pouchdb');
+var fs = require('fs');
+const logger = require('simple-node-logger');
 
-// new udp server
-var server = dgram.createSocket("udp4")
+//Load config files
+var adConfig = require('./adConfig');
+var smtpConfig = require('./smtpConfig');
+var logConfig = require('./loggerconfig');
 
-//active directory setup
-var adconfig = require('./adconfig')
-var ad = new activedirectory(adconfig)
+//Central Configuration
+//OTP section
+var OTPDigitCount = 7;
+var OTPCharacterMatrix = '0'; //0-numbers,a-lowercase,A-upercase,!-special chars,*-any char,?-custom chars
+//SMS Provider section
+var SMSProviderURL = 'https://mysmsprovider.com/sms?params=';
+//SMTP Server configuration
+var SMTPFrom = 'OneTimePassword@MyDomain.io';
+var SMTPSubject = 'MyDomain.io One Time Password'
+var autoFailbackToEmail = true;
+//Active-Active Radius server section
+var enableActiveActiveMode = false;
+var DBSyncListenPort = 3001;
+var DBSyncRemoteHost = '0.0.0.0'; //Set the remote IP address of each server before running it.
+var DBSyncRemotePort = 3001
+//RadiusConfiguration
+var sharedSecret = 'MyRadiusSecret';
+var radiusLocalPort = 1812;
 
-// highside message api URL (to send txt messages)
-var highside = 'https://api01.highside.net/start/aaaaaaaaaa?number=' // needs to be edited to a functional API URL to send text
+//Startup
+var ad = new activeDirectory(adConfig);
+var mail = new smtpClient.Mail(smtpConfig);
+if (!fs.existsSync(logConfig.logDirectory)){fs.mkdirSync(logConfig.logDirectory);}
+var log = new logger.createRollingFileLogger(logConfig);
+var server = dgram.createSocket("udp4");
+var app = express();
+var db = new PouchDB('userdb');
+app.use('/', require('express-pouchdb')(PouchDB));
+app.listen(DBSyncListenPort);
+db.changes({live: true}).on('change', console.log);
+if(enableActiveActiveMode){db.sync('http://'+DBSyncRemoteHost+': '+DBSyncRemotePort+'/userdb', {live: true, retry: true});}
+var UserUPN = function (name) {return name + '@' + adConfig.domain};
 
-//var sendTextTo = 'mobile' // refers to the LDAP attribute with the number. use mobile for AD Mobile Number, use telephoneNumber for regular AD Telephone Number.
-
-var domainify = function(name) {
-	return name+'@'+adconfig.domain
-}
-
-// radius secret
-var secret = 'radius_secret'
-
-// challange timeout in minutes
-//var timeout = 2
-
-// use challenges array as temporary store
-var challenges = []
-
-
+//Server message receive start here
 server.on("message", function (msg, rinfo) {
-	var code, username, password, packet
-	var sendResponse = function(code) {
-		var response = radius.encode_response({
-			packet: packet,
-			code: code,
-			secret: secret
-		});
+	var code, username, password, nasIP, nasIdentifier, reqId, packet;
+	let response;
+	var sendResponse = function (code) {
+		if (code === 'Access-Challenge') {
+			response = radius.encode_response({
+				packet: packet,
+				code: code,
+				identifier: reqId,
+				secret: sharedSecret,
+				attributes:[['Reply-Message', 'Enter One-Time Password:']]
+			});
+		} else {		
+			response = radius.encode_response({
+				packet: packet,
+				code: code,
+				identifier: reqId,
+				secret: sharedSecret
+			});
+		}
+        log.info(username+': Sending ' + code + ' for user');
+        server.send(response, 0, response.length, rinfo.port, rinfo.address, function (err, bytes) {
+            if (err) {
+                log.error('Error sending response to ', rinfo);
+            }
+        });
+    };
 
-		console.log('Sending ' + code + ' for user ' + username)
-		server.send(response, 0, response.length, rinfo.port, rinfo.address, function(err, bytes) {
-			if (err) {
-				console.log('Error sending response to ', rinfo)
-			}
-		});
-	}
-	packet = radius.decode({packet: msg, secret: secret})
 
-	if (packet.code != 'Access-Request') {
-		console.log('unknown packet type: ', packet.code)
+    packet = radius.decode({ packet: msg, secret: sharedSecret });
+	if (packet.code !== 'Access-Request') {
+        log.info('unknown packet type: ', packet.code);
 		return;
 	}
 
-	username = packet.attributes['User-Name']
-	password = packet.attributes['User-Password']
+    username = String.prototype.toLowerCase.apply(packet.attributes['User-Name']);
+    password = packet.attributes['User-Password'];
+	nasIP = packet.attributes['NAS-IP-Address'];
+	nasIdentifier = packet.attributes['NAS-Identifier'];
+	reqId = packet.identifier;
+	log.info('packet received:'+JSON.stringify(packet));
 
-	console.log('Access-Request for ' + username)
+	var findUserInAd = function (name, cb) {
+        ad.findUser(UserUPN(name), function (err, user) {
+            if (err) {
+                log.error('Error getting data: '+JSON.stringify(err));
+                cb(undefined);
+                return;
+            }
+            if (!user) {
+                log.warn(UserUPN(username)+': User was not found in Active Directory');
+                cb(undefined);
+            } else {
+                cb(user);
+            }
+        });
+    };
 
-	var findUserInAd = function(name, cb) {
-		// get info on requesting user
-		ad.findUser(domainify(name), function(err, user) {
-			if (err) {
-				console.log('ERROR: ' +JSON.stringify(err))
-				cb(undefined)
-				return;
+	var checkDBChallenges = function (cb){
+		db.get(String.prototype.toLowerCase.apply(username)).then(function (doc) {
+			if (String.prototype.toLowerCase.apply(doc.sAMAccountName) === String.prototype.toLowerCase.apply(username)) {
+				log.info(username+': User matches database data.');
+				if (doc.code === password) {
+					log.info(username+': Correct code found: ' + password);
+					db.remove(doc).then(function (doc) {
+					}).catch(function (err) {
+						log.error(username+': Error removing item from database: '+err);
+					});
+					sendResponse('Access-Accept');
+				} else {
+					log.info(username+': User entered the wrong code: '+password);
+					db.remove(doc).then(function (doc) {
+					}).catch(function (err) {
+						log.error(username+': Error removing item from database.');
+					});
+					log.info(username+': Removed from db and sending rad reject')
+					sendResponse('Access-Reject');
+				}
 			}
-			if (!user) {
-				console.log('User: ' + domainify(username) + ' not found.')
-				cb(undefined)
+			else {
+				log.info(username+': User not found in database. it shouldn\'t ever get here.');
+				cb();
+			}
+		}).catch(function (err){
+		console.log (err.status);
+			if (err.status === 404) {
+				log.info(username+': Database output: '+err);
 			} else {
-				cb(user)
+				log.error(username+'Database error: '+err);
 			}
-		})
-	}
+			cb();
+		});
+	};
 
-	var checkChallenges = function(cb) {
-		if (challenges.length > 0) {
-			for (i=0; i<challenges.length; i++) {
-				if (challenges[i].sAMAccountName == username) {
-					console.log('found challenge for user '+username)
-					if(challenges[i].code == password) {
-						console.log('correct code ' + password)
-						challenges.splice(i,1);
-						sendResponse('Access-Accept')
-					} else {
-						console.log('wrong code')
-						challenges.splice(i,1);
-						sendResponse('Access-Reject')
-					}
-				}
-				if (i+1 == challenges.length) {
-					console.log('no challenge for user '+username+' found')
-					cb()
-				}
-			}
-		} else {
-			console.log('no challenges found')
-			cb()
-		}	
-	}
-
-	// get info on requesting user
-	findUserInAd(username, function(user) {
-
-		if (!user) {
-			sendResponse('Access-Reject')
-		} else {
-			console.log(JSON.stringify(user))
-
-			// check if challenge exists
-			checkChallenges(function() {
-				// if no challenge, check if AD account valid
-				ad.authenticate(domainify(username), password, function(err, auth) {
-					if (err) {
-						console.log('ERROR: '+JSON.stringify(err));
-						sendResponse('Access-Reject')
-					}
-					if (auth) {
-						// set response code to 'access-challenge'
-						
-						// request sms at highside and send to user's phonenumber
-						if (user.telephoneNumber) {
-							
-							console.log('sending text to this number '+user.telephoneNumber)
-							// has phonenumber
-							request.get(highside + user.telephoneNumber, function (error, response, body) {
-								if (!error && response.statusCode == 200) {
-									user.code = body
-									challenges.push(user)
-									sendResponse('Access-Challenge')
-								}
-							})
-						} else {
-							console.log('No phone number found. Cannot send text')
-							sendResponse('Access-Reject')
+    findUserInAd(username, function (user) {
+        if (!user) {
+            sendResponse('Access-Reject');
+        } else {           
+			user['_id'] = String.prototype.toLowerCase.apply(user.sAMAccountName);
+			user['sAMAccountName'] = String.prototype.toLowerCase.apply(user.sAMAccountName);
+            checkDBChallenges(function () {
+                let randomotp = randomize(OTPCharacterMatrix, OTPDigitCount);
+				if (user.MobileNumber) {
+					let mobile = user.MobileNumber.trim();
+					log.info(user.sAMAccountName+': sending otp ' + randomotp + ' to this number ' + mobile);
+                    //You will need to modify this according to your http request scheme
+					smsHttpRequest = SMSProviderURL + mobile + "&CONTENT=Your One Time Password is: "
+					request.get(smsHttpRequest + randomotp, function (error, response, body) {
+						if (!error && response.statusCode === 200) {
+							log.info(user.sAMAccountName+': http response for user:'+response.body);
+                            user.code = randomotp;
+							db.put(user).then(function (doc) {
+							}).catch(function (err) {
+								log.error(user.sAMAccountName+': error putting data into database');
+								sendResponse('Access-Reject');
+							});
+							sendResponse('Access-Challenge');
+                        } else {
+							log.error(user.sAMAccountName+': could not send OTP to '+mobile+' - '+error);
+							sendResponse('Access-Reject');
 						}
-
+                    });
+                } else {
+                    log.info(user.sAMAccountName+': No phone number found. Cannot send text unless autoFallbackToEmail is enabled.');
+                    if (autoFailbackToEmail){
+						log.info(user.sAMAccountName+': AutoFallback - sending OTP ' + randomotp + ' to this email ' + user.mail);
+						mail.message({
+							from: SMTPFrom,
+							to: [user.mail],
+							subject: SMTPSubject
+						})
+						.body('Your OTP is: '+ randomotp).send(function(err) {
+							if (!err) {
+								user.code = randomotp;
+								db.put(user).then(function (doc) {
+								}).catch(function (err) {
+									log.error(user+': error putting data into database');
+									sendResponse('Access-Reject');
+								});
+								sendResponse('Access-Challenge');
+							} else {
+								log.error(user+': Could not send email to '+user.email+' - '+error);
+								sendResponse('Access-Reject');
+							};
+						});
 					}
-					else {
-						console.log('Authentication failed!')
-						sendResponse('Access-Reject')
-
-					}
-				})
-			})
-		}
-	})
+				}
+            });
+        }
+    });
 });
 
+//Server listener start here
 server.on("listening", function () {
 	var address = server.address();
-	console.log("radius server listening " +
+	log.info("radius server listening " +
 		address.address + ":" + address.port);
+	console.log("server started.");
 });
 
-server.bind(1812);
+server.bind(radiusLocalPort);

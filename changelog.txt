@@ -1,0 +1,31 @@
+changelog:
+v1.0
+-base version from micro23xd@Github. 
+v1.1
+-Simple OTP implementation using randomatic.
+-Changed ad.config to get different attributes.
+-Added configuration section.
+-Removed AD authentication check for now. don't need it.
+v2.0
+-temporary data storing is now done with pouchdb.
+-added more items to configuration section.
+-Implemented High Availability Radius using express and pouchdb sync.
+v2.0.1
+-Internal code fixes with case issues.
+v2.1
+-Fixed some more case issues.
+-Added basic logger.
+v2.2
+-Added smtp
+-Added automatic fallback to smtp if phone not found (currently based on an AD atribute but can be easily changed).
+-changed logger to log by date in logs folder.
+-Add automatic fallback to email if no phone number is detected (user configurable).
+v2.2.1
+-Added some more logging.
+-Fixed OTP reply message in Netscaler, which also fixed support for Pulse Secure.
+v2.2.1.1
+-Changed provider URL to another link.
+v2.2.1.2
+-Reverted to old provider URL. Made logging easier to find users.
+v2.2.1.3
+-Added trimming to the phone number
