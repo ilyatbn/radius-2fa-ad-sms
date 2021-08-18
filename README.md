@@ -13,9 +13,9 @@ The server does not validate users' Active Directory passwords.
 
 
 # Configuration:
-smtpconfig.json - Configure smtp server settings for email support.
-adconfig.js - Configure Active Directory settings to pull phone numbers.
-app.js - Main server settings.
+- smtpconfig.json - Configure smtp server settings for email support.
+- adconfig.js - Configure Active Directory settings to pull phone numbers.
+- app.js - Main server settings.
 
 
 # Installation:
